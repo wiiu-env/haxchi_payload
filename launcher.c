@@ -8,6 +8,44 @@
 /* Install functions */
 static void InstallMain(private_data_t *private_data);
 
+void wait(unsigned int coreinit_handle, unsigned int t) {
+    void (*OSYieldThread)(void);
+    OSDynLoad_FindExport(coreinit_handle, 0, "OSYieldThread", &OSYieldThread);
+
+    while(t--) {
+        OSYieldThread();
+    }
+}
+
+void doBrowserShutdown(unsigned int coreinit_handle) {
+    void*(*memset)(void *dest, uint32_t value, uint32_t bytes);
+    void*(*OSAllocFromSystem)(uint32_t size, int align);
+    void (*OSFreeToSystem)(void *ptr);
+
+    int(*IM_SetDeviceState)(int fd, void *mem, int state, int a, int b);
+    int(*IM_Close)(int fd);
+    int(*IM_Open)();
+
+    OSDynLoad_FindExport(coreinit_handle, 0, "memset", &memset);
+    OSDynLoad_FindExport(coreinit_handle, 0, "OSAllocFromSystem", &OSAllocFromSystem);
+    OSDynLoad_FindExport(coreinit_handle, 0, "OSFreeToSystem", &OSFreeToSystem);
+
+    OSDynLoad_FindExport(coreinit_handle, 0, "IM_SetDeviceState", &IM_SetDeviceState);
+    OSDynLoad_FindExport(coreinit_handle, 0, "IM_Close", &IM_Close);
+    OSDynLoad_FindExport(coreinit_handle, 0, "IM_Open", &IM_Open);
+
+    //Restart system to get lib access
+    int fd = IM_Open();
+    void *mem = OSAllocFromSystem(0x100, 64);
+    memset(mem, 0, 0x100);
+    //set restart flag to force quit browser
+    IM_SetDeviceState(fd, mem, 3, 0, 0);
+    IM_Close(fd);
+    OSFreeToSystem(mem);
+    //wait a bit for browser end
+    wait(coreinit_handle, 0x3FFFF*0x4);
+}
+
 /* ****************************************************************** */
 /*                               ENTRY POINT                          */
 /* ****************************************************************** */
@@ -19,8 +57,19 @@ void __main(void) {
     unsigned int* functionPointer;
     void* (*p_memset)(void * dest, unsigned int value, unsigned int bytes);
     void  (*_Exit)(int);
+    void  (*OSYieldThread)(void);
+    int32_t  (*OSGetCoreId)(void);
+    bool (*OSCreateThread)(void *thread, void *entry, int32_t argc, void *args, uint32_t *stack, uint32_t stack_size, int32_t priority, uint16_t attr);
+    int32_t (*OSResumeThread)(void *thread);    
+    int32_t (*OSIsThreadTerminated)(void * thread);
+    
     OSDynLoad_FindExport(coreinit_handle, 0, "memset", &p_memset);
     OSDynLoad_FindExport(coreinit_handle, 0, "_Exit", &_Exit);
+    OSDynLoad_FindExport(coreinit_handle, 0, "OSCreateThread", &OSCreateThread);
+    OSDynLoad_FindExport(coreinit_handle, 0, "OSResumeThread", &OSResumeThread);
+    OSDynLoad_FindExport(coreinit_handle, 0, "OSYieldThread", &OSYieldThread);    
+    OSDynLoad_FindExport(coreinit_handle, 0, "OSIsThreadTerminated", &OSIsThreadTerminated);
+    OSDynLoad_FindExport(coreinit_handle, 0, "OSGetCoreId", &OSGetCoreId);
 
     private_data_t private_data;
     p_memset(&private_data, 0, sizeof(private_data_t));
@@ -44,14 +93,35 @@ void __main(void) {
     
     void (*GX2Shutdown)(void);
     void (*GX2Init)(void *arg);
+    int32_t (*GX2GetMainCoreId)(void);
 
     OSDynLoad_FindExport(gx2_handle, 0, "GX2Init", &GX2Init);
     OSDynLoad_FindExport(gx2_handle, 0, "GX2Shutdown", &GX2Shutdown);
+    OSDynLoad_FindExport(gx2_handle, 0, "GX2GetMainCoreId", &GX2GetMainCoreId);
+ 
+    
+    void * thread = private_data.MEMAllocFromDefaultHeapEx(0x1000, 0x100);    
+    void * stack = private_data.MEMAllocFromDefaultHeapEx(0x1000, 0x100);    
+    OSCreateThread(thread, GX2Shutdown, 0, NULL, stack + 0x1000, 0x1000, 0, (1 << GX2GetMainCoreId()) | 0x10);
+	OSResumeThread(thread);
+    
+    while(OSIsThreadTerminated(thread) == 0){
+        OSYieldThread();
+    }
+        
+    private_data.MEMFreeToDefaultHeap(thread);
+    private_data.MEMFreeToDefaultHeap(stack);
+       
+    doBrowserShutdown(coreinit_handle);
     
     GX2Init(NULL);
+    wait(coreinit_handle, 0x3FFFF);
+    
+    if(OSGetCoreId() != GX2GetMainCoreId()) OSFatal("GX Not switched!");
+    
     run_kexploit(coreinit_handle);
     GX2Shutdown();
-
+    
     InstallMain(&private_data);
 
     Elf32_Ehdr *ehdr = (Elf32_Ehdr *) private_data.data_elf;
